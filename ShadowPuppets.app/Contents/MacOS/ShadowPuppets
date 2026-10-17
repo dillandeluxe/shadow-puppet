@@ -1,0 +1,4 @@
+#!/bin/bash
+DIR="/Users/dillanycoy/Shadow"
+cd "$DIR"
+exec "$DIR/.venv/bin/python" "$DIR/shadow_puppets.py"

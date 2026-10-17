@@ -59,7 +59,29 @@ pip install opencv-python mediapipe numpy
 
 ## Running the Application
 
-### Live Webcam Stream
+### 🚀 Automatic Launch Options (Zero Manual Setup)
+
+1. **One-Click Finder Launcher**:
+   - Double-click **`Start_Shadow_Puppets.command`** in Finder.
+   - It automatically checks the virtual environment, verifies dependencies, and opens the app!
+
+2. **Native macOS Application (`ShadowPuppets.app`)**:
+   - Double-click **`ShadowPuppets.app`** or drag it into your macOS **Dock** or **`/Applications`** folder.
+   - Includes standard macOS camera permission handling (`NSCameraUsageDescription`).
+
+3. **Auto-Start on macOS Login (LaunchAgent)**:
+   - To have Shadow Puppets automatically start every time you log into your Mac:
+     ```bash
+     ./setup_autostart.sh
+     ```
+   - To disable auto-start anytime:
+     ```bash
+     ./uninstall_autostart.sh
+     ```
+
+---
+
+### Manual Terminal Execution
 ```bash
 python shadow_puppets.py
 ```
