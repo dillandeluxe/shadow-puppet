@@ -1094,6 +1094,7 @@ class HUDOverlay:
         shadow_screen_mode: bool,
         show_landmarks: bool,
         show_guide: bool,
+        is_live_camera: bool = True,
     ) -> np.ndarray:
         """
         Draws the on-screen UI overlays over the frame.
@@ -1104,7 +1105,7 @@ class HUDOverlay:
         # ----------------------------------------------------------------------
         # Top-Left: Active Puppet Status Badge
         # ----------------------------------------------------------------------
-        cls._draw_status_card(canvas, pose, fps, shadow_screen_mode, show_landmarks)
+        cls._draw_status_card(canvas, pose, fps, shadow_screen_mode, show_landmarks, is_live_camera)
 
         # ----------------------------------------------------------------------
         # Bottom-Right: Interactive Shortcut Keys Bar
@@ -1127,6 +1128,7 @@ class HUDOverlay:
         fps: float,
         shadow_screen: bool,
         landmarks_on: bool,
+        is_live_camera: bool = True,
     ) -> None:
         """Draws the top-left status and confidence indicator card."""
         card_w, card_h = 340, 115
@@ -1182,9 +1184,9 @@ class HUDOverlay:
             lineType=cv2.LINE_AA,
         )
 
-        # Secondary info row: FPS and Mode
-        mode_str = "Screen: PARCHMENT" if shadow_screen else "Screen: CAMERA"
-        info_str = f"FPS: {fps:.1f}  |  {mode_str}  |  Mesh: {'ON' if landmarks_on else 'OFF'}"
+        # Secondary info row: FPS, Cam status, and Screen mode
+        cam_tag = "LIVE CAM" if is_live_camera else "SYNTHETIC DEMO"
+        info_str = f"FPS: {fps:.1f}  |  {cam_tag}  |  Mesh: {'ON' if landmarks_on else 'OFF'}"
         cv2.putText(
             canvas,
             info_str,
@@ -1548,36 +1550,36 @@ class ShadowPuppetsAI:
 
     def initialize_camera(self) -> bool:
         """
-        Robust camera initialization with index discovery and fallback.
+        Robust camera initialization with index discovery and AVFoundation support on macOS.
         """
         if self.demo_mode:
             logger.info("Running in Demo Mode (--demo). Camera capture bypassed.")
             return True
 
-        logger.info("Attempting to open camera index %d...", self.camera_id)
         candidate_indices = [self.camera_id, 0, 1, 2]
-        # Remove duplicates while preserving order
         unique_indices = list(dict.fromkeys(candidate_indices))
 
-        for idx in unique_indices:
-            try:
-                cap = cv2.VideoCapture(idx)
-                if cap.isOpened():
-                    # Request optimal resolution
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_w)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_h)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
+        # On macOS, prioritize AVFoundation backend explicitly
+        backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY] if sys.platform == "darwin" else [cv2.CAP_ANY]
 
-                    ret, test_frame = cap.read()
-                    if ret and test_frame is not None:
-                        self.cap = cap
-                        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        logger.info("Camera %d successfully acquired at %dx%d resolution.", idx, actual_w, actual_h)
-                        return True
-                    cap.release()
-            except Exception as e:
-                logger.warning("Error probing camera index %d: %s", idx, str(e))
+        for backend in backends:
+            backend_name = "AVFOUNDATION" if backend == cv2.CAP_AVFOUNDATION else "DEFAULT"
+            for idx in unique_indices:
+                try:
+                    logger.info("Attempting camera index %d with %s backend...", idx, backend_name)
+                    cap = cv2.VideoCapture(idx, backend) if backend != cv2.CAP_ANY else cv2.VideoCapture(idx)
+                    if cap.isOpened():
+                        # Verify frame acquisition directly before modifying capture settings
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None:
+                            self.cap = cap
+                            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            logger.info("✓ Camera index %d successfully acquired at %dx%d (%s)!", idx, actual_w, actual_h, backend_name)
+                            return True
+                        cap.release()
+                except Exception as e:
+                    logger.warning("Error probing camera index %d (%s): %s", idx, backend_name, str(e))
 
         logger.error("No functional webcam device could be opened.")
         return False
@@ -1676,6 +1678,7 @@ class ShadowPuppetsAI:
                     shadow_screen_mode=self.shadow_screen_mode,
                     show_landmarks=self.show_landmarks,
                     show_guide=self.show_guide,
+                    is_live_camera=(not self.demo_mode),
                 )
 
                 # Display frame
