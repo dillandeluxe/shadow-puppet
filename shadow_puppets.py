@@ -51,11 +51,14 @@ Usage:
 import argparse
 import logging
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
+
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 
 import cv2
 import mediapipe as mp
@@ -161,9 +164,10 @@ class HandFeatureExtractor:
         Converts MediaPipe landmarks into a structured HandLandmarksData container
         with normalized geometric metrics.
         """
-        raw_pts = [(lm.x, lm.y, lm.z) for lm in landmarks.landmark]
+        lm_list = landmarks.landmark if hasattr(landmarks, "landmark") else landmarks
+        raw_pts = [(lm.x, lm.y, lm.z) for lm in lm_list]
         px_pts = np.array(
-            [[lm.x * frame_width, lm.y * frame_height] for lm in landmarks.landmark],
+            [[lm.x * frame_width, lm.y * frame_height] for lm in lm_list],
             dtype=np.float32,
         )
 
@@ -1388,6 +1392,122 @@ class SyntheticDemoGenerator:
 
 
 # ------------------------------------------------------------------------------
+# Unified Hand Tracker (Tasks API + Legacy Solutions Fallback)
+# ------------------------------------------------------------------------------
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),        # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),        # Index
+    (5, 9), (9, 10), (10, 11), (11, 12),   # Middle
+    (9, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (13, 17), (17, 18), (18, 19), (19, 20),# Pinky
+    (0, 17),                               # Palm base
+]
+
+
+class UnifiedHandTracker:
+    """
+    Unified hand tracker:
+    Supports modern MediaPipe Tasks API (mp.tasks.vision.HandLandmarker) with
+    automatic fallback to legacy mp.solutions.hands.
+    """
+
+    def __init__(self, model_name: str = "hand_landmarker.task"):
+        self.use_tasks_api = False
+        self.detector = None
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_file = os.path.join(script_dir, model_name)
+
+        if not os.path.exists(model_file):
+            logger.info("Downloading %s model asset...", model_name)
+            import urllib.request
+            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+            try:
+                urllib.request.urlretrieve(url, model_file)
+                logger.info("Model asset downloaded to %s", model_file)
+            except Exception as e:
+                logger.warning("Could not auto-download model: %s", e)
+
+        # 1. Try modern Tasks API first
+        try:
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+            if os.path.exists(model_file):
+                base_opts = mp_python.BaseOptions(model_asset_path=model_file)
+                options = mp_vision.HandLandmarkerOptions(
+                    base_options=base_opts,
+                    num_hands=2,
+                    min_hand_detection_confidence=0.7,
+                    min_tracking_confidence=0.7,
+                    running_mode=mp_vision.RunningMode.IMAGE,
+                )
+                self.detector = mp_vision.HandLandmarker.create_from_options(options)
+                self.use_tasks_api = True
+                logger.info("Initialized modern MediaPipe HandLandmarker Tasks API.")
+        except Exception as e:
+            logger.warning("MediaPipe Tasks API initialization skipped: %s", e)
+
+        # 2. Try legacy solutions API if Tasks API not available
+        if not self.use_tasks_api:
+            if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
+                try:
+                    self.detector = mp.solutions.hands.Hands(
+                        static_image_mode=False,
+                        max_num_hands=2,
+                        model_complexity=1,
+                        min_detection_confidence=0.7,
+                        min_tracking_confidence=0.7,
+                    )
+                    logger.info("Initialized legacy MediaPipe Hands solutions API.")
+                except Exception as e:
+                    logger.error("Legacy MediaPipe initialization error: %s", e)
+            else:
+                logger.warning("MediaPipe solutions module not available in this build.")
+
+    def process(self, rgb_frame: np.ndarray) -> List[Tuple[Any, str]]:
+        """Extracts hands from an RGB frame returning list of (landmarks_21, handedness_str)."""
+        if self.detector is None:
+            return []
+
+        results: List[Tuple[Any, str]] = []
+        if self.use_tasks_api:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            detection = self.detector.detect(mp_image)
+            if detection.hand_landmarks:
+                for idx, hand_lms in enumerate(detection.hand_landmarks):
+                    label = "Right"
+                    if detection.handedness and idx < len(detection.handedness):
+                        cats = detection.handedness[idx]
+                        if cats:
+                            label = cats[0].category_name or "Right"
+                    results.append((hand_lms, label))
+        else:
+            res = self.detector.process(rgb_frame)
+            if res.multi_hand_landmarks and res.multi_handedness:
+                for lms, handedness in zip(res.multi_hand_landmarks, res.multi_handedness):
+                    label = handedness.classification[0].label
+                    results.append((lms.landmark, label))
+
+        return results
+
+    @staticmethod
+    def draw_skeleton(frame: np.ndarray, landmarks_px: np.ndarray) -> None:
+        """Draws clean anti-aliased hand bone connections and joints directly with OpenCV."""
+        for p1_idx, p2_idx in HAND_CONNECTIONS:
+            pt1 = (int(landmarks_px[p1_idx][0]), int(landmarks_px[p1_idx][1]))
+            pt2 = (int(landmarks_px[p2_idx][0]), int(landmarks_px[p2_idx][1]))
+            cv2.line(frame, pt1, pt2, (80, 220, 120), 2, lineType=cv2.LINE_AA)
+        for i in range(21):
+            pt = (int(landmarks_px[i][0]), int(landmarks_px[i][1]))
+            cv2.circle(frame, pt, 4, (45, 120, 240), -1, lineType=cv2.LINE_AA)
+            cv2.circle(frame, pt, 5, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+    def close(self):
+        if self.detector and hasattr(self.detector, "close"):
+            self.detector.close()
+
+
+# ------------------------------------------------------------------------------
 # Core Application Controller
 # ------------------------------------------------------------------------------
 class ShadowPuppetsAI:
@@ -1415,18 +1535,9 @@ class ShadowPuppetsAI:
         self.show_landmarks = False
         self.show_guide = False
 
-        # MediaPipe Hands Solution Setup
-        logger.info("Initializing MediaPipe Hands solution (max_num_hands=2, complexity=1)...")
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-        self.hands_detector = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            model_complexity=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
-        )
+        # Unified Hand Tracker Setup
+        logger.info("Initializing Hand Tracker pipeline (max_num_hands=2)...")
+        self.hand_tracker = UnifiedHandTracker()
 
         # Pipelines
         self.smoother = TemporalSmoother()
@@ -1519,35 +1630,25 @@ class ShadowPuppetsAI:
                     # MediaPipe Landmark Processing
                     # ----------------------------------------------------------
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    rgb_frame.flags.writeable = False
-                    mp_results = self.hands_detector.process(rgb_frame)
-                    rgb_frame.flags.writeable = True
+                    detected_hands = self.hand_tracker.process(rgb_frame)
 
                     extracted_hands: List[HandLandmarksData] = []
-                    if mp_results.multi_hand_landmarks and mp_results.multi_handedness:
-                        for lms, handedness in zip(mp_results.multi_hand_landmarks, mp_results.multi_handedness):
-                            label = handedness.classification[0].label
-                            # Adjust label if camera is mirrored
-                            if self.mirror_camera:
-                                label = "Left" if label == "Right" else "Right"
+                    for lms, label in detected_hands:
+                        # Adjust label if camera is mirrored
+                        if self.mirror_camera:
+                            label = "Left" if label == "Right" else "Right"
 
-                            hand_data = HandFeatureExtractor.process_hand(
-                                landmarks=lms,
-                                handedness_label=label,
-                                frame_width=w,
-                                frame_height=h,
-                            )
-                            extracted_hands.append(hand_data)
+                        hand_data = HandFeatureExtractor.process_hand(
+                            landmarks=lms,
+                            handedness_label=label,
+                            frame_width=w,
+                            frame_height=h,
+                        )
+                        extracted_hands.append(hand_data)
 
-                            # Optional Skeletal Landmark Mesh Rendering
-                            if self.show_landmarks:
-                                self.mp_drawing.draw_landmarks(
-                                    frame,
-                                    lms,
-                                    self.mp_hands.HAND_CONNECTIONS,
-                                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                                    self.mp_drawing_styles.get_default_hand_connections_style(),
-                                )
+                        # Optional Skeletal Landmark Mesh Rendering
+                        if self.show_landmarks:
+                            UnifiedHandTracker.draw_skeleton(frame, hand_data.pixel_landmarks)
 
                 # --------------------------------------------------------------
                 # Gesture Evaluation & Temporal Smoothing
@@ -1615,7 +1716,7 @@ class ShadowPuppetsAI:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        self.hands_detector.close()
+        self.hand_tracker.close()
         cv2.destroyAllWindows()
         logger.info("Cleanup completed successfully.")
 

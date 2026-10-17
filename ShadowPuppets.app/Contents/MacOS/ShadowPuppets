@@ -1,4 +1,4 @@
 #!/bin/bash
-DIR="/Users/dillanycoy/Shadow"
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../../.." >/dev/null 2>&1 && pwd )"
 cd "$DIR"
-exec "$DIR/.venv/bin/python" "$DIR/shadow_puppets.py"
+exec "$DIR/.venv/bin/python" "$DIR/shadow_puppets.py" >> /tmp/shadow_puppets_app.log 2>&1

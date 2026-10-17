@@ -4,8 +4,6 @@
 # Double-click this file in macOS Finder or run from terminal: ./Start_Shadow_Puppets.command
 # ==============================================================================
 
-set -e
-
 # Resolve the absolute directory of this script
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 cd "$SCRIPT_DIR"
@@ -31,4 +29,12 @@ echo "  - Press [S] to toggle Shadow Theater Mode"
 echo "  - Press [Q] or [ESC] to exit"
 echo "=================================================="
 
-exec .venv/bin/python shadow_puppets.py "$@"
+.venv/bin/python shadow_puppets.py "$@"
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "Application exited with code $EXIT_CODE."
+    echo "Press [Enter] to close this window..."
+    read -r
+fi
