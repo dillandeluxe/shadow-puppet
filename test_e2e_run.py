@@ -6,13 +6,13 @@ and verifying that the entire pipeline runs without any frame drops or exception
 """
 
 import os
+import tempfile
 import time
-os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "matplotlib")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 from shadow_puppets import (
-    ShadowPuppetsAI,
     GestureRecognizer,
     PuppetRenderer,
     HUDOverlay,
@@ -57,6 +57,7 @@ def benchmark_pipeline(num_frames: int = 150):
             show_landmarks=True,
             show_guide=(i > 100), # Stress-test modal guide rendering
         )
+        assert hud_frame.shape == (720, 1280, 3)
 
         t1 = time.perf_counter()
         frame_times.append(t1 - t0)

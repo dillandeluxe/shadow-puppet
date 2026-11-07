@@ -61,15 +61,19 @@ pip install opencv-python mediapipe numpy
 
 ### 🚀 Automatic Launch Options (Zero Manual Setup)
 
-1. **One-Click Finder Launcher**:
+1. **Windows One-Click Launcher**:
+   - Double-click **`Start_Shadow_Puppets.bat`** in File Explorer.
+   - Automatically detects your Python environment and launches the app with interactive controls!
+
+2. **macOS One-Click Finder Launcher**:
    - Double-click **`Start_Shadow_Puppets.command`** in Finder.
    - It automatically checks the virtual environment, verifies dependencies, and opens the app!
 
-2. **Native macOS Application (`ShadowPuppets.app`)**:
+3. **Native macOS Application (`ShadowPuppets.app`)**:
    - Double-click **`ShadowPuppets.app`** or drag it into your macOS **Dock** or **`/Applications`** folder.
    - Includes standard macOS camera permission handling (`NSCameraUsageDescription`).
 
-3. **Auto-Start on macOS Login (LaunchAgent)**:
+4. **Auto-Start on macOS Login (LaunchAgent)**:
    - To have Shadow Puppets automatically start every time you log into your Mac:
      ```bash
      ./setup_autostart.sh
@@ -84,6 +88,11 @@ pip install opencv-python mediapipe numpy
 ### Manual Terminal Execution
 ```bash
 python shadow_puppets.py
+```
+
+### Discover Available Cameras
+```bash
+python shadow_puppets.py --list-cameras
 ```
 
 ### Select Specific Camera Device
@@ -107,6 +116,9 @@ python shadow_puppets.py --demo
 | `S` | Toggle **Shadow Theater Mode** (Backlit parchment screen vs Webcam feed) |
 | `L` | Toggle **MediaPipe Skeletal Landmark Mesh** visualization |
 | `C` | Toggle **Camera Mirroring** (Left/Right flip) |
+| `N` or `TAB` | **Cycle Next Camera**: Dynamically switches to the next connected webcam |
+| `0` - `9` | **Direct Camera Switch**: Jumps directly to Camera #0 through #9 |
+| `R` | **Rescan Cameras**: Re-probes hardware for newly attached or unplugged devices |
 | `Q` or `ESC` | Cleanly exit application |
 
 ---

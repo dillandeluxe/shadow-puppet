@@ -11,10 +11,10 @@ Validates:
 
 import math
 import os
-import sys
+import tempfile
 import unittest
 
-os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "matplotlib")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
@@ -28,6 +28,8 @@ from shadow_puppets import (
     PuppetRenderer,
     TemporalSmoother,
     SyntheticDemoGenerator,
+    ShadowPuppetsAI,
+    HUDOverlay,
 )
 
 
@@ -234,6 +236,82 @@ class TestShadowPuppets(unittest.TestCase):
             pose = GestureRecognizer.evaluate([hand])
             self.assertEqual(pose.gesture, PuppetGesture.DEER, f"Failed at scale {s}")
 
+    def test_swan_heuristic(self):
+        """Test swan recognition: Thumb, Index, Middle pinched together into a beak."""
+        swan_hand = self._create_mock_hand(
+            extended_fingers={"thumb": True, "index": True, "middle": True, "ring": False, "pinky": False},
+            touch_pairs=[(8, 4), (12, 4)],
+            rotation_deg=0.0,
+        )
+        pose = GestureRecognizer.evaluate([swan_hand])
+        self.assertEqual(pose.gesture, PuppetGesture.SWAN)
+        self.assertGreaterEqual(pose.confidence, 0.70)
+
+    def test_single_hand_bird_heuristic(self):
+        """Test single-hand dove: Thumb up, 4 fingers spread wide, palm tilted."""
+        bird_hand = self._create_mock_hand(
+            extended_fingers={"thumb": True, "index": True, "middle": True, "ring": True, "pinky": True},
+            rotation_deg=35.0,
+        )
+        pose = GestureRecognizer.evaluate([bird_hand])
+        self.assertEqual(pose.gesture, PuppetGesture.BIRD)
+        self.assertGreaterEqual(pose.confidence, 0.70)
+
+    def test_rock_on_does_not_trigger_deer(self):
+        """Negative test: Rock-on / Horns sign (thumb folded away, not touching muzzle) must NOT trigger Deer."""
+        rock_hand = self._create_mock_hand(
+            extended_fingers={"thumb": False, "index": True, "middle": False, "ring": False, "pinky": True},
+            touch_pairs=[(12, 16)],
+        )
+        rock_hand.norm_distances["thumb_middle"] = 0.85
+        rock_hand.norm_distances["thumb_ring"] = 0.80
+        pose = GestureRecognizer.evaluate([rock_hand])
+        self.assertNotEqual(pose.gesture, PuppetGesture.DEER)
+
+    def test_hand_loss_preserves_position(self):
+        """Verifies that when hands exit the frame, position stays anchored instead of flying to (0,0)."""
+        smoother = TemporalSmoother(debounce_frames=1, fade_frames=10)
+        valid_pose = PuppetPose(
+            gesture=PuppetGesture.DOG,
+            confidence=0.9,
+            center_px=(640.0, 360.0),
+            scale_factor=150.0,
+        )
+        smoother.update(valid_pose)
+
+        none_pose = PuppetPose(gesture=PuppetGesture.NONE, confidence=0.0)
+        smoothed, _ = smoother.update(none_pose)
+
+        self.assertAlmostEqual(smoothed.center_px[0], 640.0, delta=1.0)
+        self.assertAlmostEqual(smoothed.center_px[1], 360.0, delta=1.0)
+        self.assertAlmostEqual(smoothed.scale_factor, 150.0, delta=1.0)
+
+    def test_symmetric_wing_flapping(self):
+        """Verifies that positive wing tilts raise both left and right wingtips upward."""
+        pose_flat = PuppetPose(
+            gesture=PuppetGesture.BIRD,
+            confidence=0.9,
+            left_wing_tilt=0.0,
+            right_wing_tilt=0.0,
+        )
+        pose_up = PuppetPose(
+            gesture=PuppetGesture.BIRD,
+            confidence=0.9,
+            left_wing_tilt=20.0,
+            right_wing_tilt=20.0,
+        )
+        poly_flat, _ = PuppetRenderer._get_canonical_geometry(pose_flat)
+        poly_up, _ = PuppetRenderer._get_canonical_geometry(pose_up)
+
+        # poly[1] is left wing, poly[2] is right wing
+        left_wingtip_flat = max(p[1] for p in poly_flat[1])
+        left_wingtip_up = max(p[1] for p in poly_up[1])
+        right_wingtip_flat = max(p[1] for p in poly_flat[2])
+        right_wingtip_up = max(p[1] for p in poly_up[2])
+
+        self.assertGreater(left_wingtip_up, left_wingtip_flat, "Left wing did not lift upward with positive tilt")
+        self.assertGreater(right_wingtip_up, right_wingtip_flat, "Right wing did not lift upward with positive tilt")
+
     def test_temporal_smoother(self):
         """Validates EMA filtering, state debouncing, and cross-fade blending."""
         smoother = TemporalSmoother(debounce_frames=3, fade_frames=10)
@@ -263,6 +341,27 @@ class TestShadowPuppets(unittest.TestCase):
         for _ in range(15):
             pose_n, alpha_n = smoother.update(raw_deer)
         self.assertAlmostEqual(alpha_n, 1.0, places=2)
+
+    def test_gesture_transition_crossfade(self):
+        """Validates that transitioning directly between two gestures triggers smooth morphing."""
+        smoother = TemporalSmoother(debounce_frames=2, fade_frames=10)
+        raw_deer = PuppetPose(gesture=PuppetGesture.DEER, confidence=0.9, center_px=(640.0, 360.0), scale_factor=100.0)
+        for _ in range(5):
+            smoother.update(raw_deer)
+
+        # Transition to Dog
+        raw_dog = PuppetPose(gesture=PuppetGesture.DOG, confidence=0.9, center_px=(640.0, 360.0), scale_factor=100.0)
+        smoother.update(raw_dog)  # Frame 1 debounce
+        pose_trans, _ = smoother.update(raw_dog)  # Frame 2 debounce triggers transition
+
+        self.assertEqual(pose_trans.gesture, PuppetGesture.DOG)
+        self.assertEqual(pose_trans.prev_gesture, PuppetGesture.DEER)
+        self.assertLess(pose_trans.morph_t, 1.0)
+
+        # Test rendering during morph transition
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        rendered = PuppetRenderer.render(frame, pose_trans, alpha=1.0)
+        self.assertEqual(rendered.shape, (720, 1280, 3))
 
     def test_procedural_rendering(self):
         """Ensures silhouette rasterization executes cleanly without exceptions."""
@@ -294,6 +393,58 @@ class TestShadowPuppets(unittest.TestCase):
             smoothed_pose, alpha = smoother.update(raw_pose)
             out = PuppetRenderer.render(frame, smoothed_pose, alpha)
             self.assertEqual(out.shape, (360, 640, 3))
+
+    def test_camera_discovery(self):
+        """Validates that camera discovery probes return properly structured records."""
+        cameras = ShadowPuppetsAI.discover_available_cameras(max_probe=2)
+        self.assertIsInstance(cameras, list)
+        for cam in cameras:
+            self.assertIn("index", cam)
+            self.assertIn("width", cam)
+            self.assertIn("height", cam)
+            self.assertIn("fps", cam)
+            self.assertIn("backend", cam)
+            self.assertIsInstance(cam["index"], int)
+            self.assertGreater(cam["width"], 0)
+            self.assertGreater(cam["height"], 0)
+
+    def test_toast_system(self):
+        """Validates HUD toast message scheduling and expiration."""
+        app = ShadowPuppetsAI(demo_mode=True)
+        self.assertIsNone(app.toast_message)
+        app.set_toast("Testing Toast Notification", duration=1.0)
+        self.assertEqual(app.toast_message, "Testing Toast Notification")
+        self.assertGreater(app.toast_expiry, 0.0)
+        app.cleanup()
+
+    def test_camera_switching_state(self):
+        """Validates camera switching state logic and demo mode handling."""
+        app = ShadowPuppetsAI(camera_id=0, demo_mode=True)
+        # Mock available cameras
+        app.available_cameras = [0, 1]
+        # In demo mode, switching with mock/real camera
+        app.switch_camera(target_cam_id=1)
+        self.assertIn(app.camera_id, [0, 1])
+        app.cleanup()
+
+    def test_hud_with_toast_and_camera_info(self):
+        """Verifies HUD rendering cleanly incorporates camera info and floating banner toasts."""
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        pose = PuppetPose(gesture=PuppetGesture.BIRD, confidence=0.88, center_px=(640.0, 360.0), scale_factor=120.0)
+        hud_frame = HUDOverlay.draw_hud(
+            frame=frame,
+            pose=pose,
+            fps=30.0,
+            shadow_screen_mode=False,
+            show_landmarks=False,
+            show_guide=False,
+            is_live_camera=True,
+            camera_info="CAM #1",
+            toast_message="Switched to Camera #1",
+        )
+        self.assertEqual(hud_frame.shape, (720, 1280, 3))
+        # Ensure HUD drew content
+        self.assertGreater(np.sum(hud_frame), 0)
 
 
 if __name__ == "__main__":

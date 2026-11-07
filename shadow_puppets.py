@@ -56,12 +56,16 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+import tempfile
+os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "matplotlib")
 
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 import numpy as np
 
 # ------------------------------------------------------------------------------
@@ -117,6 +121,9 @@ class PuppetPose:
     jaw_open: float = 0.0  # 0.0 (closed) to 1.0 (fully open) for Dog
     left_wing_tilt: float = 0.0  # Wing flap angle for Bird
     right_wing_tilt: float = 0.0  # Wing flap angle for Bird
+    # Morphing / Cross-fade state between gestures
+    prev_gesture: PuppetGesture = PuppetGesture.NONE
+    morph_t: float = 1.0  # 1.0 = active gesture, 0.0 = previous gesture
     extra_data: Dict[str, float] = field(default_factory=dict)
 
 
@@ -336,20 +343,20 @@ class GestureRecognizer:
         h1_ext_count = sum(1 for f in ["index", "middle", "ring", "pinky"] if hand1.finger_extended[f])
         h2_ext_count = sum(1 for f in ["index", "middle", "ring", "pinky"] if hand2.finger_extended[f])
 
-        # Hands should point towards opposing lateral directions
+        # Hands should point towards opposing lateral directions (or crossed with connected thumbs)
         h1_dir_x = hand1.axis_vector[0]
         h2_dir_x = hand2.axis_vector[0]
-        opposing_spread = (h1_dir_x * h2_dir_x < 0.2)  # Lateral divergence
+        opposing_spread = (h1_dir_x * h2_dir_x < 0.0) or (abs(h1_dir_x - h2_dir_x) > 0.5)
 
-        if base_connected and (h1_ext_count >= 3) and (h2_ext_count >= 3):
+        if base_connected and (h1_ext_count >= 3) and (h2_ext_count >= 3) and (opposing_spread or thumb_dist < 0.7):
             # Confidence score calculation
-            conf = 0.70
+            conf = 0.72
             if wrist_dist < 0.9 or thumb_dist < 0.6:
-                conf += 0.15
+                conf += 0.12
             if opposing_spread:
-                conf += 0.10
+                conf += 0.08
             if h1_ext_count == 4 and h2_ext_count == 4:
-                conf += 0.05
+                conf += 0.06
             conf = min(conf, 0.98)
 
             center_px = tuple(((hand1.palm_center_px + hand2.palm_center_px) / 2.0).tolist())
@@ -402,12 +409,16 @@ class GestureRecognizer:
         touch_middle_ring = nd["middle_ring"] < 0.35
         antler_spread = nd["index_pinky"] > 0.65
 
-        if (touch_thumb_middle or touch_thumb_ring or touch_middle_ring) and antler_spread:
+        # Require thumb to form the tapered muzzle with middle or ring finger
+        thumb_muzzle_contact = touch_thumb_middle or touch_thumb_ring
+        if thumb_muzzle_contact and antler_spread:
             conf = 0.75
             if touch_thumb_middle and touch_thumb_ring:
                 conf += 0.12
             if nd["index_pinky"] > 0.85:
                 conf += 0.08
+            if touch_middle_ring:
+                conf += 0.03
             conf = min(conf, 0.98)
 
             # Anchor: Palm center or midpoint between wrist and middle MCP
@@ -489,8 +500,10 @@ class GestureRecognizer:
         ears_up = fe["index"] and fe["middle"]
         paws_curled = (not fe["ring"]) and (not fe["pinky"])
         ears_parallel = nd["index_middle"] < 0.42
+        # Thumb should be folded over curled fingers, not pinched to the ear tips (which forms a Swan beak)
+        thumb_not_pinched = nd["thumb_index"] > 0.35 or nd["thumb_middle"] > 0.35
 
-        if ears_up and paws_curled and ears_parallel:
+        if ears_up and paws_curled and ears_parallel and thumb_not_pinched:
             conf = 0.75
             if nd["ring_tip_mcp"] < 0.55 and nd["pinky_tip_mcp"] < 0.55:
                 conf += 0.12
@@ -520,16 +533,22 @@ class GestureRecognizer:
         - Thumb, Index, and Middle tips pinched together forming the beak.
         - Ring and Pinky relaxed or curved behind head.
         """
+        fe = hand.finger_extended
         nd = hand.norm_distances
 
-        # Pinch between Thumb, Index, and Middle
-        beak_pinch = (nd["thumb_index"] < 0.32) and (nd["thumb_middle"] < 0.35)
-        snout_tight = nd["index_middle"] < 0.28
+        # Pinch between Thumb, Index, and Middle forming the tapered beak
+        beak_pinch = (nd["thumb_index"] < 0.35) and (nd["thumb_middle"] < 0.38)
+        snout_tight = nd["index_middle"] < 0.30
+        # Forearm / neck should be held upright, with pinky not extended straight
+        hand_upright = abs(hand.rotation_deg) < 65.0
+        pinky_relaxed = not fe["pinky"]
 
-        if beak_pinch and snout_tight:
+        if beak_pinch and snout_tight and hand_upright and pinky_relaxed:
             conf = 0.72
-            if nd["thumb_index"] < 0.20:
+            if nd["thumb_index"] < 0.22:
                 conf += 0.12
+            if abs(hand.rotation_deg) < 30.0:
+                conf += 0.08
             conf = min(conf, 0.95)
 
             center = tuple(hand.palm_center_px.tolist())
@@ -552,14 +571,16 @@ class GestureRecognizer:
         Single-Hand Bird / Flying Dove Heuristic:
         - Thumb extended upwards/forward as the bird's head and neck.
         - Index, Middle, Ring, Pinky extended and spread like plumage/wings.
+        - Palm tilted laterally (not flat upright high-five).
         """
         fe = hand.finger_extended
         nd = hand.norm_distances
 
         wings_open = fe["index"] and fe["middle"] and fe["ring"] and fe["pinky"]
         thumb_head = fe["thumb"] and (nd["thumb_index"] > 0.60)
+        lateral_tilt = abs(hand.rotation_deg) > 20.0
 
-        if wings_open and thumb_head:
+        if wings_open and thumb_head and lateral_tilt:
             conf = 0.73
             if nd["index_pinky"] > 0.90:
                 conf += 0.12
@@ -615,6 +636,8 @@ class TemporalSmoother:
 
         # Alpha cross-fade
         self.active_alpha = 0.0  # 0.0 to 1.0
+        self.prev_gesture = PuppetGesture.NONE
+        self.morph_t = 1.0
 
         # Filtered kinematics
         self.smoothed_pos = np.array([0.0, 0.0], dtype=np.float32)
@@ -641,7 +664,17 @@ class TemporalSmoother:
             self.candidate_count = 1
 
         if self.candidate_count >= self.debounce_frames:
-            self.current_gesture = self.candidate_gesture
+            if self.candidate_gesture != self.current_gesture:
+                if self.current_gesture != PuppetGesture.NONE and self.candidate_gesture != PuppetGesture.NONE:
+                    self.prev_gesture = self.current_gesture
+                    self.morph_t = 0.0
+                self.current_gesture = self.candidate_gesture
+
+        # Progress morph_t smoothly between gestures
+        if self.morph_t < 1.0:
+            self.morph_t = min(1.0, self.morph_t + (1.0 / self.fade_frames))
+            if self.morph_t >= 1.0:
+                self.prev_gesture = PuppetGesture.NONE
 
         # 2. Alpha fade-in / fade-out
         if self.current_gesture != PuppetGesture.NONE:
@@ -650,30 +683,38 @@ class TemporalSmoother:
             self.active_alpha = max(0.0, self.active_alpha - (1.0 / self.fade_frames))
 
         # 3. Low-Pass Kinematic Smoothing
-        raw_pos = np.array(raw_pose.center_px, dtype=np.float32)
-        if np.linalg.norm(self.smoothed_pos) < 1.0:
-            self.smoothed_pos = raw_pos
-            self.smoothed_scale = raw_pose.scale_factor
+        # Only update kinematics when a valid pose is detected, preserving the last
+        # known anchor and scale during fade-out to prevent shrinking or drifting to (0, 0).
+        if raw_pose.gesture != PuppetGesture.NONE:
+            raw_pos = np.array(raw_pose.center_px, dtype=np.float32)
+            if self.active_alpha <= 0.01 or np.linalg.norm(self.smoothed_pos) < 1.0:
+                self.smoothed_pos = raw_pos
+                self.smoothed_scale = raw_pose.scale_factor
+                rad = math.radians(raw_pose.rotation_deg)
+                self.smoothed_cos = math.cos(rad)
+                self.smoothed_sin = math.sin(rad)
+            else:
+                self.smoothed_pos = self.alpha_pos * raw_pos + (1.0 - self.alpha_pos) * self.smoothed_pos
+                self.smoothed_scale = (
+                    self.alpha_scale * raw_pose.scale_factor + (1.0 - self.alpha_scale) * self.smoothed_scale
+                )
+                # Angular smoothing via unit circle vector components to avoid wraparound jumps
+                rad = math.radians(raw_pose.rotation_deg)
+                curr_cos = math.cos(rad)
+                curr_sin = math.sin(rad)
+                self.smoothed_cos = self.alpha_rot * curr_cos + (1.0 - self.alpha_rot) * self.smoothed_cos
+                self.smoothed_sin = self.alpha_rot * curr_sin + (1.0 - self.alpha_rot) * self.smoothed_sin
+
+            # Dynamic Kinematic Parameters
+            self.smoothed_jaw = 0.4 * raw_pose.jaw_open + 0.6 * self.smoothed_jaw
+            self.smoothed_left_wing = 0.4 * raw_pose.left_wing_tilt + 0.6 * self.smoothed_left_wing
+            self.smoothed_right_wing = 0.4 * raw_pose.right_wing_tilt + 0.6 * self.smoothed_right_wing
+            self.flip_horizontal = raw_pose.flip_horizontal
+            self.confidence = raw_pose.confidence
         else:
-            self.smoothed_pos = self.alpha_pos * raw_pos + (1.0 - self.alpha_pos) * self.smoothed_pos
-            self.smoothed_scale = (
-                self.alpha_scale * raw_pose.scale_factor + (1.0 - self.alpha_scale) * self.smoothed_scale
-            )
+            self.confidence = max(0.0, self.confidence - (1.0 / self.fade_frames))
 
-        # Angular smoothing via unit circle vector components to avoid wraparound jumps
-        rad = math.radians(raw_pose.rotation_deg)
-        curr_cos = math.cos(rad)
-        curr_sin = math.sin(rad)
-        self.smoothed_cos = self.alpha_rot * curr_cos + (1.0 - self.alpha_rot) * self.smoothed_cos
-        self.smoothed_sin = self.alpha_rot * curr_sin + (1.0 - self.alpha_rot) * self.smoothed_sin
         smoothed_angle_deg = math.degrees(math.atan2(self.smoothed_sin, self.smoothed_cos))
-
-        # Dynamic Kinematic Parameters
-        self.smoothed_jaw = 0.4 * raw_pose.jaw_open + 0.6 * self.smoothed_jaw
-        self.smoothed_left_wing = 0.4 * raw_pose.left_wing_tilt + 0.6 * self.smoothed_left_wing
-        self.smoothed_right_wing = 0.4 * raw_pose.right_wing_tilt + 0.6 * self.smoothed_right_wing
-        self.flip_horizontal = raw_pose.flip_horizontal
-        self.confidence = raw_pose.confidence
 
         smoothed_pose = PuppetPose(
             gesture=self.current_gesture,
@@ -685,6 +726,8 @@ class TemporalSmoother:
             jaw_open=float(self.smoothed_jaw),
             left_wing_tilt=float(self.smoothed_left_wing),
             right_wing_tilt=float(self.smoothed_right_wing),
+            prev_gesture=self.prev_gesture,
+            morph_t=float(self.morph_t),
         )
 
         return smoothed_pose, self.active_alpha
@@ -756,34 +799,57 @@ class PuppetRenderer:
         overlay = np.zeros_like(output)
         mask = np.zeros((h, w), dtype=np.uint8)
 
-        # Transform and draw each polygon component
-        for poly in polygons:
-            poly_arr = np.array(poly, dtype=np.float32)
-            transformed = (poly_arr @ M.T) + anchor
-            pts_int = np.int32(transformed)
+        # Draw components with support for cross-fade morphing between gestures
+        morph_curr = float(pose.morph_t)
+        morph_prev = (1.0 - morph_curr) if (pose.prev_gesture != PuppetGesture.NONE and morph_curr < 1.0) else 0.0
 
-            # Fill silhouette polygon
-            cv2.fillPoly(overlay, [pts_int], cls.CHARCOAL_SHADOW, lineType=cv2.LINE_AA)
-            cv2.fillPoly(mask, [pts_int], 255, lineType=cv2.LINE_AA)
+        gesture_layers = []
+        if morph_prev > 0.01:
+            prev_polys, prev_eyes = cls._get_canonical_geometry(pose, gesture=pose.prev_gesture)
+            if prev_polys:
+                gesture_layers.append((prev_polys, prev_eyes, morph_prev))
 
-            # Soft rim-glow edge
-            cv2.polylines(overlay, [pts_int], isClosed=True, color=cls.AMBER_RIM_GLOW, thickness=2, lineType=cv2.LINE_AA)
+        polygons, eye_circles = cls._get_canonical_geometry(pose)
+        if polygons:
+            gesture_layers.append((polygons, eye_circles, morph_curr if morph_prev > 0.01 else 1.0))
 
-        # Transform and carve glowing eye apertures
-        for center_u, center_v, radius in eye_circles:
-            eye_pos = (np.array([center_u, center_v], dtype=np.float32) @ M.T) + anchor
-            eye_r = max(2, int(radius * s))
-            pt_center = (int(eye_pos[0]), int(eye_pos[1]))
+        if not gesture_layers:
+            return output
 
-            # Draw glowing aperture
-            cv2.circle(overlay, pt_center, eye_r, cls.EYE_APERTURE_COLOR, thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(overlay, pt_center, eye_r + 1, cls.AMBER_RIM_GLOW, thickness=1, lineType=cv2.LINE_AA)
+        for polys, eyes, weight in gesture_layers:
+            alpha_int = int(np.clip(255 * weight, 0, 255))
+            for poly in polys:
+                poly_arr = np.array(poly, dtype=np.float32)
+                transformed = (poly_arr @ M.T) + anchor
+                pts_int = np.int32(transformed)
 
-        # Alpha composite overlay over frame
+                # Fill silhouette polygon
+                cv2.fillPoly(overlay, [pts_int], cls.CHARCOAL_SHADOW, lineType=cv2.LINE_AA)
+                cv2.fillPoly(mask, [pts_int], alpha_int, lineType=cv2.LINE_AA)
+
+                # Soft rim-glow edge
+                cv2.polylines(overlay, [pts_int], isClosed=True, color=cls.AMBER_RIM_GLOW, thickness=2, lineType=cv2.LINE_AA)
+
+            # Transform and carve glowing eye apertures
+            for center_u, center_v, radius in eyes:
+                eye_pos = (np.array([center_u, center_v], dtype=np.float32) @ M.T) + anchor
+                eye_r = max(2, int(radius * s))
+                pt_center = (int(eye_pos[0]), int(eye_pos[1]))
+
+                # Draw glowing aperture
+                cv2.circle(overlay, pt_center, eye_r, cls.EYE_APERTURE_COLOR, thickness=-1, lineType=cv2.LINE_AA)
+                cv2.circle(overlay, pt_center, eye_r + 1, cls.AMBER_RIM_GLOW, thickness=1, lineType=cv2.LINE_AA)
+                cv2.circle(mask, pt_center, eye_r + 1, alpha_int, thickness=-1, lineType=cv2.LINE_AA)
+
+        # Alpha composite overlay over frame with subpixel anti-aliasing preservation
         effective_alpha = float(np.clip(alpha * 0.88, 0.0, 1.0))
-        mask_3ch = cv2.merge([mask, mask, mask]) > 0
-        blended = cv2.addWeighted(overlay, effective_alpha, output, 1.0 - effective_alpha * 0.4, 0)
-        np.copyto(output, blended, where=mask_3ch)
+        active_indices = mask > 0
+        if np.any(active_indices):
+            alpha_f = (mask[active_indices].astype(np.float32) / 255.0) * effective_alpha
+            alpha_3d = alpha_f[:, np.newaxis]
+            fg = overlay[active_indices].astype(np.float32)
+            bg = output[active_indices].astype(np.float32)
+            output[active_indices] = np.uint8(fg * alpha_3d + bg * (1.0 - alpha_3d))
 
         return output
 
@@ -794,26 +860,27 @@ class PuppetRenderer:
         """
         # Convert to grayscale to preserve hand shadow contrast
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Invert slightly and apply vignette / warm backlight
-        parchment = np.zeros_like(frame)
-        parchment[:, :, 0] = np.uint8(np.clip(gray * 0.70 + 35, 0, 255))  # B
-        parchment[:, :, 1] = np.uint8(np.clip(gray * 0.85 + 45, 0, 255))  # G
-        parchment[:, :, 2] = np.uint8(np.clip(gray * 0.95 + 50, 0, 255))  # R
+        # Optimized uint8 scaling without float64 heap allocations
+        b = cv2.convertScaleAbs(gray, alpha=0.70, beta=35)
+        g = cv2.convertScaleAbs(gray, alpha=0.85, beta=45)
+        r = cv2.convertScaleAbs(gray, alpha=0.95, beta=50)
+        parchment = cv2.merge([b, g, r])
         return cv2.addWeighted(parchment, 0.85, frame, 0.15, 0)
 
     @classmethod
     def _get_canonical_geometry(
-        cls, pose: PuppetPose
+        cls, pose: PuppetPose, gesture: Optional[PuppetGesture] = None
     ) -> Tuple[List[List[Tuple[float, float]]], List[Tuple[float, float, float]]]:
         """
         Returns procedural canonical 2D contours and eye apertures for each puppet.
         Coordinates are defined around (0, 0) anchor:
         +v is along the fingers/hand axis, +u is lateral.
         """
+        active_gesture = gesture if gesture is not None else pose.gesture
         polygons: List[List[Tuple[float, float]]] = []
         eyes: List[Tuple[float, float, float]] = []
 
-        if pose.gesture == PuppetGesture.DOG:
+        if active_gesture == PuppetGesture.DOG:
             # ------------------------------------------------------------------
             # Stylized Dog / Barking Wolf Silhouette
             # ------------------------------------------------------------------
@@ -873,7 +940,7 @@ class PuppetRenderer:
             # Eye aperture (almond cutout)
             eyes.append((-5.0, 95.0, 4.5))
 
-        elif pose.gesture == PuppetGesture.DEER:
+        elif active_gesture == PuppetGesture.DEER:
             # ------------------------------------------------------------------
             # Stylized Deer / Regal Stag with Branching Antlers
             # ------------------------------------------------------------------
@@ -921,7 +988,7 @@ class PuppetRenderer:
             # Deer Eye aperture
             eyes.append((0.0, 88.0, 4.0))
 
-        elif pose.gesture == PuppetGesture.BIRD:
+        elif active_gesture == PuppetGesture.BIRD:
             # ------------------------------------------------------------------
             # Stylized Bird / Soaring Eagle Silhouette
             # ------------------------------------------------------------------
@@ -970,10 +1037,11 @@ class PuppetRenderer:
             rot_left = []
             for u, v in raw_left_wing:
                 # Pivot around (-22.0, 35.0)
+                # Rotate symmetrically: positive wing tilt lifts both wings upward (+v)
                 du = u - (-22.0)
                 dv = v - 35.0
-                ru = -22.0 + (du * math.cos(left_rad) - dv * math.sin(left_rad))
-                rv = 35.0 + (du * math.sin(left_rad) + dv * math.cos(left_rad))
+                ru = -22.0 + (du * math.cos(left_rad) + dv * math.sin(left_rad))
+                rv = 35.0 + (-du * math.sin(left_rad) + dv * math.cos(left_rad))
                 rot_left.append((ru, rv))
             polygons.append(rot_left)
 
@@ -1003,7 +1071,7 @@ class PuppetRenderer:
             eyes.append((-3.0, 85.0, 3.5))
             eyes.append((3.0, 85.0, 3.5))
 
-        elif pose.gesture == PuppetGesture.RABBIT:
+        elif active_gesture == PuppetGesture.RABBIT:
             # ------------------------------------------------------------------
             # Stylized Rabbit / Bunny Silhouette
             # ------------------------------------------------------------------
@@ -1037,7 +1105,7 @@ class PuppetRenderer:
             # Big curious eye
             eyes.append((4.0, 75.0, 5.0))
 
-        elif pose.gesture == PuppetGesture.SWAN:
+        elif active_gesture == PuppetGesture.SWAN:
             # ------------------------------------------------------------------
             # Stylized Swan / Graceful S-Neck Silhouette
             # ------------------------------------------------------------------
@@ -1095,6 +1163,8 @@ class HUDOverlay:
         show_landmarks: bool,
         show_guide: bool,
         is_live_camera: bool = True,
+        camera_info: str = "LIVE CAM",
+        toast_message: Optional[str] = None,
     ) -> np.ndarray:
         """
         Draws the on-screen UI overlays over the frame.
@@ -1105,7 +1175,13 @@ class HUDOverlay:
         # ----------------------------------------------------------------------
         # Top-Left: Active Puppet Status Badge
         # ----------------------------------------------------------------------
-        cls._draw_status_card(canvas, pose, fps, shadow_screen_mode, show_landmarks, is_live_camera)
+        cls._draw_status_card(canvas, pose, fps, shadow_screen_mode, show_landmarks, camera_info)
+
+        # ----------------------------------------------------------------------
+        # Floating Toast Banner Notification (if active)
+        # ----------------------------------------------------------------------
+        if toast_message:
+            cls._draw_toast(canvas, w, h, toast_message)
 
         # ----------------------------------------------------------------------
         # Bottom-Right: Interactive Shortcut Keys Bar
@@ -1128,7 +1204,7 @@ class HUDOverlay:
         fps: float,
         shadow_screen: bool,
         landmarks_on: bool,
-        is_live_camera: bool = True,
+        camera_info: str = "LIVE CAM",
     ) -> None:
         """Draws the top-left status and confidence indicator card."""
         card_w, card_h = 340, 115
@@ -1185,8 +1261,7 @@ class HUDOverlay:
         )
 
         # Secondary info row: FPS, Cam status, and Screen mode
-        cam_tag = "LIVE CAM" if is_live_camera else "SYNTHETIC DEMO"
-        info_str = f"FPS: {fps:.1f}  |  {cam_tag}  |  Mesh: {'ON' if landmarks_on else 'OFF'}"
+        info_str = f"FPS: {fps:.1f}  |  {camera_info}  |  Mesh: {'ON' if landmarks_on else 'OFF'}"
         cv2.putText(
             canvas,
             info_str,
@@ -1199,15 +1274,43 @@ class HUDOverlay:
         )
 
     @classmethod
+    def _draw_toast(cls, canvas: np.ndarray, w: int, h: int, message: str) -> None:
+        """Renders an elegant glassmorphism banner pill in the top-center of the screen."""
+        font = cv2.FONT_HERSHEY_DUPLEX
+        font_scale = 0.52
+        thickness = 1
+        text_size, _ = cv2.getTextSize(message, font, font_scale, thickness)
+        tw, th = text_size
+        pad_x, pad_y = 20, 10
+        bw, bh = tw + pad_x * 2, th + pad_y * 2
+        bx = max(10, (w - bw) // 2)
+        by = 20
+
+        sub = canvas[by : by + bh, bx : bx + bw]
+        card = np.full_like(sub, (20, 24, 34))
+        cv2.addWeighted(card, 0.88, sub, 0.12, 0, sub)
+        cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), cls.COLOR_ACCENT, 1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            message,
+            (bx + pad_x, by + th + pad_y - 2),
+            font,
+            font_scale,
+            cls.COLOR_TEXT_MAIN,
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+    @classmethod
     def _draw_controls_bar(cls, canvas: np.ndarray, w: int, h: int, guide_open: bool) -> None:
         """Draws a clean bottom shortcut helper bar."""
-        bar_text = "[H] Puppet Guide  |  [S] Shadow Theater  |  [L] Landmarks  |  [C] Flip Cam  |  [Q/ESC] Quit"
+        bar_text = "[H] Guide  |  [S] Theater  |  [L] Mesh  |  [C] Flip  |  [N] Switch Cam  |  [0-9] Cam #  |  [Q/ESC] Quit"
         cv2.putText(
             canvas,
             bar_text,
-            (22, h - 18),
+            (20, h - 18),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.44,
+            0.41,
             cls.COLOR_TEXT_MAIN,
             1,
             lineType=cv2.LINE_AA,
@@ -1223,7 +1326,7 @@ class HUDOverlay:
         # Dimmed backdrop
         sub = canvas[my : my + modal_h, mx : mx + modal_w]
         card = np.full_like(sub, (15, 15, 18))
-        cv2.addWeighted(card, 0.92, sub, 0.08, 0, sub)
+        cv2.addWeighted(card, 0.72, sub, 0.28, 0, sub)
         cv2.rectangle(canvas, (mx, my), (mx + modal_w, my + modal_h), (80, 80, 95), 2, lineType=cv2.LINE_AA)
 
         # Modal Header
@@ -1306,7 +1409,7 @@ class SyntheticDemoGenerator:
         cycling through Bird, Dog, and Deer gestures smoothly.
         """
         self.t += 0.035
-        cycle = int(self.t // 5) % 3  # Cycles every 5 seconds
+        cycle = int(self.t // 5) % 5  # Cycles through all 5 classic puppet shapes
 
         # Create aesthetic ambient canvas
         frame = np.zeros((self.h, self.w, 3), dtype=np.uint8)
@@ -1321,18 +1424,79 @@ class SyntheticDemoGenerator:
         rot_deg = 15.0 * math.sin(self.t * 0.9)
         rad = math.radians(rot_deg)
 
-        # Build mock 21 landmarks
+        if cycle == 3:
+            # Synthetic Two-Hand Bird: Crossed wrists/thumbs with flapping flight feathers
+            wing_tilt = 20.0 * math.sin(self.t * 3.5)
+            h1_rot = -25.0 - wing_tilt
+            h2_rot = 25.0 + wing_tilt
+            h1_rad = math.radians(h1_rot)
+            h2_rad = math.radians(h2_rot)
+
+            h1_px = np.zeros((21, 2), dtype=np.float32)
+            h2_px = np.zeros((21, 2), dtype=np.float32)
+
+            h1_px[0] = [cx - scale * 0.15, cy + scale * 0.2]
+            h1_px[9] = [cx - scale * 0.35, cy - scale * 0.3]
+            h1_px[4] = [cx, cy - scale * 0.1]
+            for idx in [8, 12, 16, 20]:
+                h1_px[idx] = [cx - scale * 0.8, cy - scale * 0.4]
+
+            h2_px[0] = [cx + scale * 0.15, cy + scale * 0.2]
+            h2_px[9] = [cx + scale * 0.35, cy - scale * 0.3]
+            h2_px[4] = [cx, cy - scale * 0.1]
+            for idx in [8, 12, 16, 20]:
+                h2_px[idx] = [cx + scale * 0.8, cy - scale * 0.4]
+
+            for i in range(21):
+                if np.linalg.norm(h1_px[i]) < 1.0:
+                    h1_px[i] = [cx - scale * 0.2, cy]
+                if np.linalg.norm(h2_px[i]) < 1.0:
+                    h2_px[i] = [cx + scale * 0.2, cy]
+
+            fe_wings = {"thumb": True, "index": True, "middle": True, "ring": True, "pinky": True}
+            nd_wings = {
+                "thumb_index": 0.6, "thumb_middle": 0.6, "thumb_ring": 0.6, "thumb_pinky": 0.6,
+                "index_middle": 0.3, "middle_ring": 0.3, "ring_pinky": 0.3, "index_pinky": 0.9,
+                "index_tip_mcp": 1.2, "middle_tip_mcp": 1.2, "ring_tip_mcp": 1.2, "pinky_tip_mcp": 1.2,
+            }
+
+            hand1 = HandLandmarksData(
+                label="Left",
+                raw_landmarks=[(p[0] / self.w, p[1] / self.h, 0.0) for p in h1_px],
+                pixel_landmarks=h1_px,
+                wrist_px=h1_px[0],
+                middle_mcp_px=h1_px[9],
+                palm_center_px=np.array([cx - scale * 0.2, cy], dtype=np.float32),
+                hand_length_px=scale,
+                axis_vector=np.array([math.sin(h1_rad), -math.cos(h1_rad)], dtype=np.float32),
+                rotation_deg=h1_rot,
+                finger_extended=fe_wings,
+                norm_distances=nd_wings,
+            )
+            hand2 = HandLandmarksData(
+                label="Right",
+                raw_landmarks=[(p[0] / self.w, p[1] / self.h, 0.0) for p in h2_px],
+                pixel_landmarks=h2_px,
+                wrist_px=h2_px[0],
+                middle_mcp_px=h2_px[9],
+                palm_center_px=np.array([cx + scale * 0.2, cy], dtype=np.float32),
+                hand_length_px=scale,
+                axis_vector=np.array([math.sin(h2_rad), -math.cos(h2_rad)], dtype=np.float32),
+                rotation_deg=h2_rot,
+                finger_extended=fe_wings,
+                norm_distances=nd_wings,
+            )
+            return frame, [hand1, hand2]
+
+        # Build mock 21 landmarks for single-hand gestures
         px_pts = np.zeros((21, 2), dtype=np.float32)
         px_pts[0] = [cx, cy + scale * 0.5]  # Wrist
         px_pts[9] = [cx, cy - scale * 0.5]  # Middle MCP
 
         if cycle == 0:
             # Synthetic Deer: Index and Pinky extended, middle/ring touching thumb
-            # Index tip
             px_pts[8] = [cx - scale * 0.45, cy - scale * 1.2]
-            # Pinky tip
             px_pts[20] = [cx + scale * 0.45, cy - scale * 1.2]
-            # Thumb, Middle, Ring pinched together
             px_pts[4] = [cx, cy - scale * 0.7]
             px_pts[12] = [cx, cy - scale * 0.7]
             px_pts[16] = [cx, cy - scale * 0.7]
@@ -1342,12 +1506,11 @@ class SyntheticDemoGenerator:
             px_pts[8] = [cx - scale * 0.35, cy - scale * 1.1]
             px_pts[12] = [cx + scale * 0.3, cy - scale * 0.9]
             px_pts[16] = [cx + scale * 0.28, cy - scale * 0.88]
-            # Barking thumb
             bark_y = cy - scale * (0.65 - 0.25 * abs(math.sin(self.t * 4.0)))
             px_pts[4] = [cx + scale * 0.25, bark_y]
             px_pts[20] = [cx - scale * 0.2, cy - scale * 0.4]
             fe = {"thumb": True, "index": True, "middle": True, "ring": True, "pinky": False}
-        else:
+        elif cycle == 2:
             # Synthetic Rabbit: Index & Middle up together
             px_pts[8] = [cx - scale * 0.1, cy - scale * 1.2]
             px_pts[12] = [cx + scale * 0.1, cy - scale * 1.2]
@@ -1355,6 +1518,18 @@ class SyntheticDemoGenerator:
             px_pts[16] = [cx + scale * 0.1, cy - scale * 0.3]
             px_pts[20] = [cx + scale * 0.2, cy - scale * 0.3]
             fe = {"thumb": False, "index": True, "middle": True, "ring": False, "pinky": False}
+        else:
+            # Synthetic Swan: Vertical neck with pinched beak
+            rot_deg = 5.0 * math.sin(self.t * 0.8)
+            rad = math.radians(rot_deg)
+            beak_u = cx + scale * 0.25
+            beak_v = cy - scale * 1.15
+            px_pts[4] = [beak_u, beak_v]
+            px_pts[8] = [beak_u + 3, beak_v]
+            px_pts[12] = [beak_u + 2, beak_v + 3]
+            px_pts[16] = [cx - scale * 0.15, cy - scale * 0.5]
+            px_pts[20] = [cx - scale * 0.25, cy - scale * 0.4]
+            fe = {"thumb": True, "index": True, "middle": True, "ring": False, "pinky": False}
 
         # Fill remaining joints
         for i in range(21):
@@ -1416,6 +1591,7 @@ class UnifiedHandTracker:
     def __init__(self, model_name: str = "hand_landmarker.task"):
         self.use_tasks_api = False
         self.detector = None
+        self._last_timestamp_ms = 0
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         model_file = os.path.join(script_dir, model_name)
@@ -1424,13 +1600,23 @@ class UnifiedHandTracker:
             logger.info("Downloading %s model asset...", model_name)
             import urllib.request
             url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+            tmp_model_file = model_file + ".tmp"
             try:
-                urllib.request.urlretrieve(url, model_file)
-                logger.info("Model asset downloaded to %s", model_file)
+                urllib.request.urlretrieve(url, tmp_model_file)
+                if os.path.exists(tmp_model_file) and os.path.getsize(tmp_model_file) > 1000000:
+                    os.replace(tmp_model_file, model_file)
+                    logger.info("Model asset downloaded to %s", model_file)
+                elif os.path.exists(tmp_model_file):
+                    os.remove(tmp_model_file)
             except Exception as e:
                 logger.warning("Could not auto-download model: %s", e)
+                if os.path.exists(tmp_model_file):
+                    try:
+                        os.remove(tmp_model_file)
+                    except OSError:
+                        pass
 
-        # 1. Try modern Tasks API first
+        # 1. Try modern Tasks API first with real-time video tracking
         try:
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision as mp_vision
@@ -1441,11 +1627,11 @@ class UnifiedHandTracker:
                     num_hands=2,
                     min_hand_detection_confidence=0.7,
                     min_tracking_confidence=0.7,
-                    running_mode=mp_vision.RunningMode.IMAGE,
+                    running_mode=mp_vision.RunningMode.VIDEO,
                 )
                 self.detector = mp_vision.HandLandmarker.create_from_options(options)
                 self.use_tasks_api = True
-                logger.info("Initialized modern MediaPipe HandLandmarker Tasks API.")
+                logger.info("Initialized modern MediaPipe HandLandmarker Tasks API (Video Tracking Mode).")
         except Exception as e:
             logger.warning("MediaPipe Tasks API initialization skipped: %s", e)
 
@@ -1474,7 +1660,12 @@ class UnifiedHandTracker:
         results: List[Tuple[Any, str]] = []
         if self.use_tasks_api:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            detection = self.detector.detect(mp_image)
+            if hasattr(self.detector, "detect_for_video"):
+                now_ms = max(self._last_timestamp_ms + 1, int(time.perf_counter() * 1000))
+                self._last_timestamp_ms = now_ms
+                detection = self.detector.detect_for_video(mp_image, now_ms)
+            else:
+                detection = self.detector.detect(mp_image)
             if detection.hand_landmarks:
                 for idx, hand_lms in enumerate(detection.hand_landmarks):
                     label = "Right"
@@ -1531,6 +1722,11 @@ class ShadowPuppetsAI:
         self.target_h = height
         self.demo_mode = demo_mode
 
+        # Multi-camera discovery and Toast state
+        self.available_cameras: List[int] = []
+        self.toast_message: Optional[str] = None
+        self.toast_expiry: float = 0.0
+
         # Interactive State Flags
         self.mirror_camera = True
         self.shadow_screen_mode = False
@@ -1548,34 +1744,146 @@ class ShadowPuppetsAI:
         # Camera handle
         self.cap: Optional[cv2.VideoCapture] = None
 
-    def initialize_camera(self) -> bool:
+    def set_toast(self, message: str, duration: float = 2.5) -> None:
+        """Schedules a temporary floating HUD toast message."""
+        self.toast_message = message
+        self.toast_expiry = time.perf_counter() + duration
+
+    @classmethod
+    def get_preferred_backend(cls) -> int:
+        """Returns the optimal platform-native video capture backend."""
+        if sys.platform == "win32":
+            return cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            return cv2.CAP_AVFOUNDATION
+        elif sys.platform.startswith("linux"):
+            return cv2.CAP_V4L2
+        return cv2.CAP_ANY
+
+    @classmethod
+    def discover_available_cameras(cls, max_probe: int = 6) -> List[Dict[str, Any]]:
         """
-        Robust camera initialization with index discovery and AVFoundation support on macOS.
+        Probes connected hardware camera indices and returns a list of active devices
+        with index, default resolution, and backend details.
+        """
+        try:
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+        except Exception:
+            pass
+
+        discovered: List[Dict[str, Any]] = []
+        primary_backend = cls.get_preferred_backend()
+        backends = [primary_backend]
+        if primary_backend != cv2.CAP_ANY:
+            backends.append(cv2.CAP_ANY)
+
+        for idx in range(max_probe):
+            for backend in backends:
+                try:
+                    cap = cv2.VideoCapture(idx, backend) if backend != cv2.CAP_ANY else cv2.VideoCapture(idx)
+                    if cap.isOpened():
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None:
+                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            backend_name = (
+                                "DSHOW"
+                                if backend == cv2.CAP_DSHOW
+                                else "AVFOUNDATION"
+                                if backend == cv2.CAP_AVFOUNDATION
+                                else "V4L2"
+                                if backend == cv2.CAP_V4L2
+                                else "ANY"
+                            )
+                            discovered.append(
+                                {
+                                    "index": idx,
+                                    "width": w,
+                                    "height": h,
+                                    "fps": fps if fps > 0 else 30.0,
+                                    "backend": backend_name,
+                                }
+                            )
+                            cap.release()
+                            break
+                        cap.release()
+                except Exception as e:
+                    logger.debug("Probe failed for camera %d with backend %s: %s", idx, backend, e)
+
+        return discovered
+
+    def initialize_camera(self, target_cam_id: Optional[int] = None) -> bool:
+        """
+        Initializes webcam device with target resolution and platform-optimized backend.
+        If target_cam_id is specified, attempts that index first; otherwise uses self.camera_id
+        or falls back to any available discovered device.
         """
         if self.demo_mode:
             logger.info("Running in Demo Mode (--demo). Camera capture bypassed.")
             return True
 
-        candidate_indices = [self.camera_id, 0, 1, 2]
-        unique_indices = list(dict.fromkeys(candidate_indices))
+        if target_cam_id is not None:
+            self.camera_id = target_cam_id
 
-        # On macOS, prioritize AVFoundation backend explicitly
-        backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY] if sys.platform == "darwin" else [cv2.CAP_ANY]
+        # Discover devices if list not yet cached
+        if not self.available_cameras:
+            discovered_info = self.discover_available_cameras(max_probe=6)
+            self.available_cameras = [cam["index"] for cam in discovered_info]
+            logger.info("Discovered %d active camera device(s): %s", len(self.available_cameras), self.available_cameras)
 
-        for backend in backends:
-            backend_name = "AVFOUNDATION" if backend == cv2.CAP_AVFOUNDATION else "DEFAULT"
-            for idx in unique_indices:
+        # Build candidate indices starting with desired camera_id
+        candidates = [self.camera_id] + [c for c in self.available_cameras if c != self.camera_id]
+        if not candidates:
+            candidates = [0, 1]
+
+        # Release existing capture handle if open
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+        primary_backend = self.get_preferred_backend()
+        backends = [primary_backend]
+        if primary_backend != cv2.CAP_ANY:
+            backends.append(cv2.CAP_ANY)
+
+        for idx in candidates:
+            for backend in backends:
+                backend_name = (
+                    "DSHOW"
+                    if backend == cv2.CAP_DSHOW
+                    else "AVFOUNDATION"
+                    if backend == cv2.CAP_AVFOUNDATION
+                    else "V4L2"
+                    if backend == cv2.CAP_V4L2
+                    else "DEFAULT"
+                )
                 try:
                     logger.info("Attempting camera index %d with %s backend...", idx, backend_name)
                     cap = cv2.VideoCapture(idx, backend) if backend != cv2.CAP_ANY else cv2.VideoCapture(idx)
                     if cap.isOpened():
-                        # Verify frame acquisition directly before modifying capture settings
+                        # Set target capture resolution
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_w)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_h)
                         ret, test_frame = cap.read()
                         if ret and test_frame is not None:
                             self.cap = cap
+                            self.camera_id = idx
+                            if idx not in self.available_cameras:
+                                self.available_cameras.append(idx)
+                                self.available_cameras.sort()
                             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            logger.info("✓ Camera index %d successfully acquired at %dx%d (%s)!", idx, actual_w, actual_h, backend_name)
+                            logger.info(
+                                "✓ Camera index %d successfully acquired at %dx%d (%s)!",
+                                idx,
+                                actual_w,
+                                actual_h,
+                                backend_name,
+                            )
                             return True
                         cap.release()
                 except Exception as e:
@@ -1583,6 +1891,60 @@ class ShadowPuppetsAI:
 
         logger.error("No functional webcam device could be opened.")
         return False
+
+    def switch_camera(self, target_cam_id: Optional[int] = None) -> bool:
+        """
+        Switches between connected cameras dynamically during runtime.
+        If target_cam_id is provided, switches directly to that camera index;
+        otherwise cycles to the next available camera in self.available_cameras.
+        """
+        if not self.available_cameras:
+            discovered = self.discover_available_cameras(max_probe=6)
+            self.available_cameras = [c["index"] for c in discovered]
+
+        if not self.available_cameras:
+            self.set_toast("No camera devices detected!", duration=3.0)
+            return False
+
+        current_id = self.camera_id
+        if target_cam_id is not None:
+            next_cam = target_cam_id
+        else:
+            if current_id in self.available_cameras:
+                curr_pos = self.available_cameras.index(current_id)
+                next_cam = self.available_cameras[(curr_pos + 1) % len(self.available_cameras)]
+            else:
+                next_cam = self.available_cameras[0]
+
+        if next_cam == current_id and self.cap is not None and not self.demo_mode:
+            self.set_toast(f"Already on Cam #{current_id} (only 1 camera found)", duration=2.5)
+            return True
+
+        old_demo = self.demo_mode
+        self.demo_mode = False
+        success = self.initialize_camera(target_cam_id=next_cam)
+        if success and self.cap is not None:
+            actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cam_pos = self.available_cameras.index(self.camera_id) + 1 if self.camera_id in self.available_cameras else 1
+            total = len(self.available_cameras)
+            self.set_toast(f"Switched to Cam #{self.camera_id} ({actual_w}x{actual_h}) [{cam_pos}/{total}]", duration=3.0)
+            logger.info("Successfully switched to Camera #%d", self.camera_id)
+            return True
+        else:
+            logger.warning("Failed to switch to Camera #%d, reverting...", next_cam)
+            self.demo_mode = old_demo
+            self.initialize_camera(target_cam_id=current_id)
+            self.set_toast(f"Camera #{next_cam} unavailable", duration=3.0)
+            return False
+
+    def rescan_cameras(self) -> None:
+        """Rescans the system for newly connected or disconnected cameras."""
+        self.set_toast("Scanning camera devices...", duration=1.5)
+        discovered = self.discover_available_cameras(max_probe=6)
+        self.available_cameras = [c["index"] for c in discovered]
+        self.set_toast(f"Found {len(self.available_cameras)} camera(s): {self.available_cameras}", duration=3.0)
+        logger.info("Rescanned cameras: %s", self.available_cameras)
 
     def run(self) -> None:
         """
@@ -1615,8 +1977,18 @@ class ShadowPuppetsAI:
                 # --------------------------------------------------------------
                 if self.demo_mode:
                     frame, extracted_hands = self.demo_gen.generate_frame_and_landmarks()
+                    # Throttle synthetic demo mode to target ~30 FPS to prevent 100% CPU lock
+                    elapsed = time.perf_counter() - curr_time
+                    target_interval = 1.0 / 30.0
+                    if elapsed < target_interval:
+                        time.sleep(target_interval - elapsed)
                 else:
-                    assert self.cap is not None
+                    if self.cap is None:
+                        logger.warning("No camera handle available. Falling back to demo mode.")
+                        self.demo_mode = True
+                        self.set_toast("Camera lost. Switched to Demo Mode.", duration=3.0)
+                        continue
+
                     success, frame = self.cap.read()
                     if not success or frame is None:
                         logger.warning("Empty camera frame received. Re-probing...")
@@ -1671,6 +2043,14 @@ class ShadowPuppetsAI:
                 # --------------------------------------------------------------
                 # High-Contrast Head-Up Display (HUD)
                 # --------------------------------------------------------------
+                active_toast = None
+                if self.toast_message:
+                    if time.perf_counter() < self.toast_expiry:
+                        active_toast = self.toast_message
+                    else:
+                        self.toast_message = None
+
+                cam_label = "SYNTHETIC DEMO" if self.demo_mode else f"CAM #{self.camera_id}"
                 frame = HUDOverlay.draw_hud(
                     frame=frame,
                     pose=smoothed_pose,
@@ -1679,6 +2059,8 @@ class ShadowPuppetsAI:
                     show_landmarks=self.show_landmarks,
                     show_guide=self.show_guide,
                     is_live_camera=(not self.demo_mode),
+                    camera_info=cam_label,
+                    toast_message=active_toast,
                 )
 
                 # Display frame
@@ -1693,16 +2075,25 @@ class ShadowPuppetsAI:
                     break
                 elif key in (ord("s"), ord("S")):
                     self.shadow_screen_mode = not self.shadow_screen_mode
+                    self.set_toast(f"Theater Mode: {'ON' if self.shadow_screen_mode else 'OFF'}")
                     logger.info("Shadow Screen Mode toggled: %s", self.shadow_screen_mode)
                 elif key in (ord("l"), ord("L")):
                     self.show_landmarks = not self.show_landmarks
+                    self.set_toast(f"Hand Mesh: {'ON' if self.show_landmarks else 'OFF'}")
                     logger.info("Landmarks Overlay toggled: %s", self.show_landmarks)
                 elif key in (ord("h"), ord("H")):
                     self.show_guide = not self.show_guide
                     logger.info("Gesture Cheat Sheet toggled: %s", self.show_guide)
                 elif key in (ord("c"), ord("C")):
                     self.mirror_camera = not self.mirror_camera
+                    self.set_toast(f"Mirroring: {'ON' if self.mirror_camera else 'OFF'}")
                     logger.info("Mirror Camera toggled: %s", self.mirror_camera)
+                elif key in (ord("n"), ord("N"), 9):  # 'N' or TAB to cycle next camera
+                    self.switch_camera()
+                elif ord("0") <= key <= ord("9"):  # 0-9 to switch directly to camera index
+                    self.switch_camera(target_cam_id=(key - ord("0")))
+                elif key in (ord("r"), ord("R")):  # Rescan cameras
+                    self.rescan_cameras()
 
         except KeyboardInterrupt:
             logger.info("Application interrupted by user. Cleaning up...")
@@ -1755,8 +2146,36 @@ def main() -> None:
         action="store_true",
         help="Run synthetic animated demo mode (useful for testing without physical camera)",
     )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Scan and list all detected camera devices on the system, then exit",
+    )
 
     args = parser.parse_args()
+
+    if args.list_cameras:
+        print("=" * 64)
+        print(" Hand-Gesture Shadow Puppets AI - Camera Device Discovery")
+        print("=" * 64)
+        print("Probing available video capture devices on system...")
+        cams = ShadowPuppetsAI.discover_available_cameras(max_probe=8)
+        if not cams:
+            print("No video capture devices were detected.")
+            print("Tip: Ensure your webcam is plugged in and camera permissions are granted.")
+        else:
+            print(f"Found {len(cams)} available camera device(s):\n")
+            for c in cams:
+                print(f"  [Camera #{c['index']}]")
+                print(f"    Resolution: {c['width']}x{c['height']}")
+                print(f"    Backend:    {c['backend']}")
+                print(f"    FPS:        {c['fps']:.1f}")
+                print(f"    Launch CLI: python shadow_puppets.py --camera {c['index']}\n")
+            print("Runtime Keyboard Shortcuts:")
+            print("  [N] or [TAB]  Cycle to the next detected camera")
+            print("  [0-9]         Switch directly to camera #0 through #9")
+            print("  [R]           Rescan for newly connected or disconnected cameras\n")
+        return
 
     app = ShadowPuppetsAI(
         camera_id=args.camera,

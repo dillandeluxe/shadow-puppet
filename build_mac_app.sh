@@ -48,11 +48,20 @@ cat <<EOF > "$CONTENTS_DIR/Info.plist"
 EOF
 
 # Executable entrypoint
-cat <<EOF > "$MACOS_DIR/ShadowPuppets"
+cat <<'EOF' > "$MACOS_DIR/ShadowPuppets"
 #!/bin/bash
-DIR="$SCRIPT_DIR"
-cd "\$DIR"
-exec "\$DIR/.venv/bin/python" "\$DIR/shadow_puppets.py"
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../../.." >/dev/null 2>&1 && pwd )"
+cd "$DIR"
+
+if [ -f "$DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$DIR/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    PYTHON_BIN="python"
+fi
+
+exec "$PYTHON_BIN" "$DIR/shadow_puppets.py" >> /tmp/shadow_puppets_app.log 2>&1
 EOF
 
 chmod +x "$MACOS_DIR/ShadowPuppets"
