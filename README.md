@@ -70,7 +70,7 @@ pip install opencv-python mediapipe numpy
    - It automatically checks the virtual environment, verifies dependencies, and opens the app!
 
 3. **Native macOS Application (`ShadowPuppets.app`)**:
-   - Double-click **`ShadowPuppets.app`** or drag it into your macOS **Dock** or **`/Applications`** folder.
+   - Run `./build_mac_app.sh` once to create it, then double-click **`ShadowPuppets.app`** or drag it into your macOS **Dock** or **`/Applications`** folder.
    - Includes standard macOS camera permission handling (`NSCameraUsageDescription`).
 
 4. **Auto-Start on macOS Login (LaunchAgent)**:
