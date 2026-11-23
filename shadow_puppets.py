@@ -1736,6 +1736,9 @@ class ShadowPuppetsAI:
         # Unified Hand Tracker Setup
         logger.info("Initializing Hand Tracker pipeline (max_num_hands=2)...")
         self.hand_tracker = UnifiedHandTracker()
+        if self.hand_tracker.detector is None and not self.demo_mode:
+            logger.error("No hand tracker available. Falling back to Demo Mode.")
+            self.demo_mode = True
 
         # Pipelines
         self.smoother = TemporalSmoother()
@@ -1870,6 +1873,8 @@ class ShadowPuppetsAI:
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_h)
                         ret, test_frame = cap.read()
                         if ret and test_frame is not None:
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_w)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_h)
                             self.cap = cap
                             self.camera_id = idx
                             if idx not in self.available_cameras:
@@ -1960,6 +1965,7 @@ class ShadowPuppetsAI:
         cv2.resizeWindow(window_name, self.target_w, self.target_h)
 
         fps_tracker = 30.0
+        failed_reads = 0
         prev_time = time.perf_counter()
 
         logger.info("Starting Shadow Puppets AI stream. Press [Q] or [ESC] to quit, [H] for guide.")
@@ -1991,9 +1997,16 @@ class ShadowPuppetsAI:
 
                     success, frame = self.cap.read()
                     if not success or frame is None:
-                        logger.warning("Empty camera frame received. Re-probing...")
-                        time.sleep(0.01)
+                        failed_reads += 1
+                        if failed_reads >= 30:
+                            logger.error("Camera stopped delivering frames. Falling back to Demo Mode.")
+                            self.cap.release()
+                            self.cap = None
+                            self.demo_mode = True
+                        else:
+                            cv2.waitKey(10)  # keep the window responsive while retrying
                         continue
+                    failed_reads = 0
 
                     if self.mirror_camera:
                         frame = cv2.flip(frame, 1)

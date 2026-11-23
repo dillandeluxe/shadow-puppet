@@ -31,9 +31,9 @@ cat <<EOF > "$TARGET_PLIST"
     <key>KeepAlive</key>
     <false/>
     <key>StandardOutPath</key>
-    <string>/tmp/shadow_puppets.log</string>
+    <string>$HOME/Library/Logs/ShadowPuppets.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/shadow_puppets.err</string>
+    <string>$HOME/Library/Logs/ShadowPuppets.err</string>
 </dict>
 </plist>
 EOF

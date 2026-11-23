@@ -447,5 +447,85 @@ class TestShadowPuppets(unittest.TestCase):
         self.assertGreater(np.sum(hud_frame), 0)
 
 
+class TestRobustness(unittest.TestCase):
+    """Regression tests for audit findings: imports, download, tracker and camera failures."""
+
+    def test_type_hints_resolve(self):
+        """Python < 3.14 evaluates hints at import; a missing `Any` import crashed there."""
+        import typing
+        import shadow_puppets as sp
+        typing.get_type_hints(sp.HandFeatureExtractor.process_hand)
+        typing.get_type_hints(sp.UnifiedHandTracker.process)
+
+    def test_failed_download_leaves_no_partial_model(self):
+        import tempfile
+        from unittest import mock
+        import shadow_puppets as sp
+
+        def broken_download(url, dest):
+            with open(dest, "wb") as f:
+                f.write(b"partial")
+            raise OSError("network dropped")
+
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "m.task")
+            with mock.patch("urllib.request.urlretrieve", broken_download):
+                sp.UnifiedHandTracker(model).close()
+            self.assertEqual(os.listdir(d), [])
+
+    def test_no_tracker_falls_back_to_demo(self):
+        from unittest import mock
+        import shadow_puppets as sp
+
+        stub = mock.Mock(detector=None)
+        with mock.patch.object(sp, "UnifiedHandTracker", return_value=stub):
+            self.assertTrue(sp.ShadowPuppetsAI(demo_mode=False).demo_mode)
+
+    def test_dead_camera_falls_back_to_demo(self):
+        from unittest import mock
+        import shadow_puppets as sp
+
+        class DeadCap:
+            reads = 0
+            def read(self):
+                DeadCap.reads += 1
+                if DeadCap.reads > 500:
+                    raise RuntimeError("loop never gave up")
+                return False, None
+            def release(self):
+                pass
+
+        with mock.patch.object(sp, "UnifiedHandTracker", return_value=mock.Mock(detector=object())):
+            app = sp.ShadowPuppetsAI(width=320, height=180)
+        app.cap = DeadCap()
+        with mock.patch.object(app, "initialize_camera", return_value=True), \
+                mock.patch.object(sp.cv2, "namedWindow"), mock.patch.object(sp.cv2, "resizeWindow"), \
+                mock.patch.object(sp.cv2, "imshow"), mock.patch.object(sp.cv2, "destroyAllWindows"), \
+                mock.patch.object(sp.cv2, "waitKey", return_value=ord("q")):
+            app.run()
+        self.assertTrue(app.demo_mode)
+
+    def test_camera_gets_requested_size(self):
+        from unittest import mock
+        import shadow_puppets as sp
+
+        sets = []
+
+        class FakeCap:
+            def __init__(self, *a): pass
+            def isOpened(self): return True
+            def read(self): return True, np.zeros((4, 4, 3), np.uint8)
+            def get(self, prop): return 0
+            def set(self, prop, val): sets.append((prop, val))
+            def release(self): pass
+
+        with mock.patch.object(sp, "UnifiedHandTracker", return_value=mock.Mock(detector=object())):
+            app = sp.ShadowPuppetsAI(width=640, height=360)
+        with mock.patch.object(sp.cv2, "VideoCapture", FakeCap):
+            self.assertTrue(app.initialize_camera())
+        self.assertIn((sp.cv2.CAP_PROP_FRAME_WIDTH, 640), sets)
+        self.assertIn((sp.cv2.CAP_PROP_FRAME_HEIGHT, 360), sets)
+
+
 if __name__ == "__main__":
     unittest.main()

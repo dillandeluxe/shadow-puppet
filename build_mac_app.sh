@@ -61,7 +61,7 @@ else
     PYTHON_BIN="python"
 fi
 
-exec "$PYTHON_BIN" "$DIR/shadow_puppets.py" >> /tmp/shadow_puppets_app.log 2>&1
+exec "$PYTHON_BIN" "$DIR/shadow_puppets.py" >> "\$HOME/Library/Logs/ShadowPuppets.log" 2>&1
 EOF
 
 chmod +x "$MACOS_DIR/ShadowPuppets"
