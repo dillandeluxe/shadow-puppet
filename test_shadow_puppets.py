@@ -19,18 +19,17 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 
-from shadow_puppets import (
+from demo import SyntheticDemoGenerator
+from gestures import (
+    GestureRecognizer,
     HandFeatureExtractor,
     HandLandmarksData,
-    GestureRecognizer,
     PuppetGesture,
     PuppetPose,
-    PuppetRenderer,
     TemporalSmoother,
-    SyntheticDemoGenerator,
-    ShadowPuppetsAI,
-    HUDOverlay,
 )
+from rendering import HUDOverlay, PuppetRenderer
+from shadow_puppets import ShadowPuppetsAI
 
 
 class TestShadowPuppets(unittest.TestCase):

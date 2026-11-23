@@ -12,13 +12,9 @@ os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "matplotlib")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
-from shadow_puppets import (
-    GestureRecognizer,
-    PuppetRenderer,
-    HUDOverlay,
-    SyntheticDemoGenerator,
-    TemporalSmoother,
-)
+from demo import SyntheticDemoGenerator
+from gestures import GestureRecognizer, TemporalSmoother
+from rendering import HUDOverlay, PuppetRenderer
 
 def benchmark_pipeline(num_frames: int = 150):
     print(f"--- Benchmarking Shadow Puppets AI for {num_frames} frames ---")
